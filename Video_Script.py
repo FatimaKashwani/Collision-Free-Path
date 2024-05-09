@@ -13,7 +13,10 @@ from mmcv.runner import (
     load_checkpoint,
     wrap_fp16_model,
 )
+from scipy.interpolate import InterpolatedUnivariateSpline
+from scipy.ndimage import gaussian_filter1d
 import torch.nn.functional as F
+from scipy.signal import savgol_filter
 #from mmseg.models.segmentors.encoder_decoder import whole_inference
 #from mmseg.datasets import replace_ImageToTensor as rep
 from mmcv.parallel import collate, scatter
@@ -225,6 +228,290 @@ def calculate_weighted_sum(prev_paths, current_path):
     
     return weighted_sum
 
+def find_center_path_smooth_new(binary_mask, image, last_5_outs, max_iou, theta=None):
+
+        # Assuming blueMask is given, and is a binary image where blue pixels are set to 1 and other pixels are set to 0.
+        binary_image = binary_mask
+
+        rows, cols, _ = binary_mask.shape
+        center_locations = []
+        
+        for i in range(rows):
+            row = binary_mask[i, :]
+            white_pixels = np.where(row[:, 0] == 255)[0]
+
+            # Example: Weighted average (here weights are the same, but you can change)
+            weights = np.ones_like(white_pixels)  # replace with actual weights if needed
+            if len(white_pixels) > 0:
+                center_x = int(round(np.average(white_pixels, weights=weights)))
+                center_locations.append((center_x, i))
+                
+
+                
+                
+        if len(center_locations) == 0:      
+            return image, None, None, None, None, last_5_outs
+
+
+        center_locations = np.array(center_locations)
+
+        # center_locations = np.array(center_locations)[5:-1, :]
+
+        xo = center_locations[:, 0]
+        yo = center_locations[:, 1]
+
+        x = xo.copy()
+        y = yo.copy()
+        
+        
+        OUTns=(x,y)
+        xypoints = center_locations.copy()
+        
+        # Subsample x and y
+        step_size = len(x) // 10
+
+        if step_size == 0:
+            step_size = 1
+        x = x[::step_size]
+        y = y[::step_size]
+        
+        subsampled_xypoints = xypoints[::step_size]
+        # print("points:",subsampled_xypoints)
+
+        # Ensure the last points are the same
+        x[-1] = xo[-1]
+        y[-1] = yo[-1]
+        
+        xw=x
+        yw=y
+        xnn=x.copy()
+
+               
+        # Calculate the average 'out' if there are previous 'outs' to average
+        if len(last_5_outs) > 1:
+            # Determine the number of points to smooth (last 30%)
+            num_points_to_smooth = int(len(last_5_outs[0]) * 0.5)
+            starting_index = len(last_5_outs[0]) - num_points_to_smooth
+            
+            # Validate if the starting index is not negative
+            starting_index = max(0, starting_index)
+
+            # Extract the points to be smoothed and the remaining points
+            points_to_smooth = [xnn[starting_index:] for xnn in last_5_outs if len(xnn) >= num_points_to_smooth]
+            remaining_points = [xnn[:starting_index] for xnn in last_5_outs if len(xnn) >= num_points_to_smooth]
+            # print("points2smooth:", points_to_smooth)
+            
+            if points_to_smooth:
+                # Calculate the average of the points to be smoothed
+                avg_smoothed_points = [sum(col) / len(col) for col in zip(*points_to_smooth)]
+
+                # Get the actual remaining points from the current frame (not averaged)
+                actual_remaining_points = xnn[:starting_index]
+
+                # Combine the actual remaining and smoothed points
+                smoothed_out = np.concatenate((actual_remaining_points, avg_smoothed_points))
+        else:
+            smoothed_out = xnn
+            
+        
+        last_5_outs.append(smoothed_out)
+        
+        new_x = []
+        new_y = []
+
+        x_min = np.max(y)
+        #Curvature adjustment
+        if theta != None:
+                        theta = theta / 9.8 * 3.1
+                        #print(theta)
+                        
+
+                        #print(smoothed_out.tolist())
+                        #xs, ys = zip(*smoothed_out.tolist())
+                        xs = smoothed_out
+                        ys = yw
+
+                        #for (x, y) in trajectory[0]:
+                        for i in range(min(len(xs),len(ys))):
+                            x = xs[i]
+                            y = ys[i]
+                            #y_prime = int(y + 30*(x - x_min) * velocity * np.sin(theta))
+                            x_prime = int(x - 10*(x - x_min) * np.sin(theta))
+                            #print("compare" + str(y) + " "+ str(y_prime))
+                            #if y_prime >= 1280: y_prime = 1279
+                            #if y_prime >= binary_mask.shape[1]: y_prime = binary_mask.shape[1] - 1
+                            if x_prime >= binary_mask.shape[0]: x_prime = binary_mask.shape[0] - 1
+                            #center_points[i] = (x, y_prime)
+                            #y_prime = y
+
+                            #if(binary_mask[x,y_prime] != (0,0,0)).all():
+                            
+                            tolerance = 0
+                            if 0 <= y < binary_mask.shape[1] and 0 <= x_prime < binary_mask.shape[0]:
+                               
+                                #if (np.abs(binary_mask[x_prime, y] - (255, 0, 0)) > tolerance).any():
+                                if np.array_equal(binary_mask[y, x_prime], [255, 0, 0]):
+
+                                    #new_center_points.append((x_prime, y))
+                                    new_x.append(x_prime)
+                                    new_y.append(y)
+                                    
+
+
+                            else:
+
+                                print("Indices out of bounds:", x_prime, y)
+        
+        
+        #print(new_center_points[30])
+        if len(new_x) >= 1:
+            smoothed_out = np.array(new_x)
+            y = np.array(new_y)
+
+        # Smooth using Savitzky-Golay filter
+        window_length = 5
+        if window_length > len(smoothed_out):
+            window_length = len(smoothed_out)
+        polyorder = 7
+        if polyorder >= window_length:
+            # Adjust window_length to be greater than polyorder
+            polyorder = window_length - 1
+
+        xs = savgol_filter(smoothed_out, window_length, polyorder)
+
+        # Further smooth using moving average
+        window_size = len(xs) // 4
+        if window_size == 0:
+            window_size = len(xs)  # or choose another appropriate default value
+
+        smooth_data = np.convolve(xs, np.ones(window_size)/window_size, mode='valid')
+        if len(smooth_data) == 1 and len(xs) > 0:
+            new_value = 2 * smooth_data[0] - xs[-1]
+            smooth_data = np.array([smooth_data[0], new_value])
+
+
+        # Interpolation back to the original length
+        xq = np.linspace(0, len(smooth_data)-1, len(xo))
+        cs = CubicSpline(range(len(smooth_data)), smooth_data)
+        interpolated_smooth_data = cs(xq)
+
+        # Round to nearest integer
+        interpolated_smooth_data = np.round(interpolated_smooth_data)
+        x = interpolated_smooth_data
+        y = yo
+
+        # print(out)
+        
+        
+        smoothing_factor= 0.4
+        
+        smoothing_factor = min(max(smoothing_factor, 0), 1)
+
+        # Calculate the y-values on the straight line
+        x_start, x_end = x[0], x[-1]
+        x_line = np.linspace(x_start, x_end, len(x))
+
+        # Smoothing the y-coordinates
+        x_smoothed = np.round(smoothing_factor * x_line + (1 - smoothing_factor) * x)
+            
+
+
+        n = len(x_smoothed)
+        if n >= 15:
+            first_30_percent_index = int(n * 0.3)
+            last_30_percent_index = int(n * 0.7)
+            last_30_percent_index2 = int(n * 0.5)
+
+            # First 30% points
+            x_first = np.linspace(0, first_30_percent_index, first_30_percent_index)
+            y_first = x_smoothed[:first_30_percent_index]
+
+            spline_first = InterpolatedUnivariateSpline(x_first, y_first, k=3)
+            x_new = np.linspace(0, first_30_percent_index, n)
+            y_first_extended = spline_first(x_new)
+
+            # Last 30% points
+            x_last = np.linspace(last_30_percent_index, n-1, n - last_30_percent_index)
+            y_last = x_smoothed[last_30_percent_index:]
+            spline_last = InterpolatedUnivariateSpline(x_last, y_last, k=3)
+            x_new = np.linspace(last_30_percent_index, n-1, n)
+            y_last_extended = spline_last(x_new)
+
+            # Averaging
+            x_smoothed1 = np.round(y_first_extended + y_last_extended) / 2
+
+            x_smoothed2 = np.concatenate((x_smoothed[:last_30_percent_index2], x_smoothed1[last_30_percent_index2:]))
+        #elif n > 5: 
+            #x_smoothed2 = InterpolatedUnivariateSpline(x_smoothed, y, k=3)
+        else:
+            x_smoothed2 = x_smoothed
+
+
+
+        def smooth_array(x):
+            sigma = 20  # Standard deviation for Gaussian kernel
+            return gaussian_filter1d(x, sigma)
+
+        x_smoothed2 = smooth_array(x_smoothed2)
+            
+
+
+
+
+
+
+
+
+
+
+        out = (x_smoothed2, y)
+        smoothed_out = out
+        #if max_iou <= 0.75:
+            #smoothed_out = last_5_CompPaths[-1]
+        #else: 
+            #smoothed_out = out
+            #last_5_CompPaths.append(smoothed_out)
+
+
+        # # Calculate the average 'out' if there are previous 'outs' to average
+        # if len(self.last_5_outs) > 1:
+            # all_x = [out[0] for out in self.last_5_outs if len(out[0]) == len(self.last_5_outs[0][0])]
+            # all_y = [out[1] for out in self.last_5_outs if len(out[1]) == len(self.last_5_outs[0][1])]
+
+            # if all_x and all_y:
+                # avg_x = [sum(col) / len(col) for col in zip(*all_x)]
+                # avg_y = [sum(col) / len(col) for col in zip(*all_y)]
+                # smoothed_out = (avg_x, avg_y)
+            # else:
+                # smoothed_out = out
+        # else:
+            # smoothed_out = out
+
+
+        # Store the 'out' in the deque
+        # self.last_5_outs.append(smoothed_out)
+        # print(smoothed_out)
+        # print(out[0])
+        # print(out[1])
+
+        # color_mask = cv2.cvtColor(binary_mask, cv2.COLOR_GRAY2BGR)
+        #if self.reverse_color_channels:
+            #color_mask = image[:, :, ::-1]  # Convert BGR to RGB
+        #else:
+        color_mask = image        
+
+        prev_point = None
+        for i in range(len(smoothed_out[0])):
+            point = (int(smoothed_out[0][i]), int(smoothed_out[1][i]))
+            if np.array_equal(binary_mask[point[1],point[0]], [255, 0, 0]):
+                cv2.circle(color_mask, point, 2, (0, 255, 0), -1)
+
+                if prev_point is not None:
+                    cv2.line(color_mask, prev_point, point, (0, 255, 0), 1)
+                prev_point = point
+        
+        return color_mask, smoothed_out, xw, yw, OUTns, last_5_outs
+
 def GeneratePath(mask, OrigImg, PrevPaths = [], theta = None):
             #egocolor = np.array([86, 211, 219])
             center_points_list = []
@@ -396,36 +683,92 @@ def GeneratePath(mask, OrigImg, PrevPaths = [], theta = None):
             #out2[mask3] = cv2.addWeighted(OrigImg, alpha, newmask, 1-alpha, 0)[mask3]
             return center_points_list[0], OrigImg
 
-def find_center_path_smooth(binary_mask, image):
+def find_center_path_smooth(binary_mask, image, theta=None):
     
     rows, cols, _ = binary_mask.shape
     trajectory = []
 
     for i in range(rows):
         row = binary_mask[i, :]
-        white_pixels = np.where(row == 255)[0]
+        #white_pixels = np.where(row == 255)[0]
+        white_pixels = np.where(row[:, 0] == 255)[0]
+
         if len(white_pixels) > 0:
             center_x = int(np.mean(white_pixels))
             trajectory.append((center_x, i))
 
     trajectory = np.array(trajectory)
+
+    if len(trajectory) < 1: return image, trajectory
     #print(trajectory)
-    dist = 50 #add eq: x1 + v*tau
+    dist = 0 #add eq: x1 + v*tau
     xstart = 0
     xpos = 0
-    if len(trajectory)>60:
 
+    #print("trajectory length: "+ str(len(trajectory)))
+    if len(trajectory)>0:
+        x_min = trajectory[-1][1]
         xstart = trajectory[np.argmax(trajectory,axis=0)][0][0]
         #xstart = trajectory[0][0]
         xpos = xstart - dist 
+
+
+        #color_mask = cv2.cvtColor(binary_mask, cv2.COLOR_GRAY2BGR)
+        #theta = joysticks[1].get_axis(0) / 9.8 * 3.1
+        
+        
+        #print(trajectory.shape)
+        new_center_points = []
+        if theta != None:
+                        theta = theta / 9.8 * 3.1
+                        #print(theta)
+                        
+                        velocity = 1
+                        xs, ys = zip(*trajectory)
+
+                        #for (x, y) in trajectory[0]:
+                        for i in range(len(xs)):
+                            x = xs[i]
+                            y = ys[i]
+                            #y_prime = int(y + 30*(x - x_min) * velocity * np.sin(theta))
+                            x_prime = int(x - 30*(y - x_min) * velocity * np.sin(theta))
+                            #print("compare" + str(y) + " "+ str(y_prime))
+                            #if y_prime >= 1280: y_prime = 1279
+                            #if y_prime >= binary_mask.shape[1]: y_prime = binary_mask.shape[1] - 1
+                            if x_prime >= binary_mask.shape[0]: x_prime = binary_mask.shape[0] - 1
+                            #center_points[i] = (x, y_prime)
+                            #y_prime = y
+
+                            #if(binary_mask[x,y_prime] != (0,0,0)).all():
+                            
+                            tolerance = 0
+                            if 0 <= y < binary_mask.shape[1] and 0 <= x_prime < binary_mask.shape[0]:
+                               
+                                #if (np.abs(binary_mask[x_prime, y] - (255, 0, 0)) > tolerance).any():
+                                if np.array_equal(binary_mask[y, x_prime], [255, 0, 0]):
+
+                                    new_center_points.append((x_prime, y))
+                                    
+
+
+                            else:
+
+                                print("Indices out of bounds:", x_prime, y)
+        
+        
+        #print(new_center_points[30])
+        if len(new_center_points) >= 1:
+            trajectory = np.array(new_center_points)
+        #print(trajectory[30])
+        #print(trajectory.shape)
+        #print(trajectory[0][-1])
         trajectory = trajectory[:len(trajectory) - dist]
         x, y = trajectory[:, 0], trajectory[:, 1]
 
         tck, u = splprep([x, y], s=500) 
         unew = np.linspace(0, 1.0, 50 *len(trajectory))  
-        out = splev(unew, tck)
 
-        #color_mask = cv2.cvtColor(binary_mask, cv2.COLOR_GRAY2BGR)
+        out = splev(unew, tck)
 
         prev_point = None
         for i in range(len(out[0])):
@@ -435,8 +778,9 @@ def find_center_path_smooth(binary_mask, image):
 
             if prev_point is not None:
                 cv2.line(image, prev_point, point, (0, 0, 0), 1)
-            prev_point = point
 
+            prev_point = point
+        '''
         rectangle_color = (255, 0, 0)  # BGR color (red in this case)
         startpt = (250, xpos)
         endpt = (800, xstart)
@@ -453,7 +797,8 @@ def find_center_path_smooth(binary_mask, image):
         mask = shapes.astype(bool)
         out[mask] = cv2.addWeighted(image, alpha, shapes, 1 - alpha, 0)[mask]
         image = out
-    return image
+        '''
+    return image, trajectory
 
 
 def create_custom_colormap(num_classes):
@@ -592,7 +937,7 @@ def init_segmentor(config, checkpoint=None, device='cuda:0'):
     model.eval()
     return model
 
-def predict_img(args):
+def predict_img(args, ds="kitti"):
 
     torch.cuda.set_device(0)
     """Detection Model"""
@@ -666,7 +1011,7 @@ def predict_img(args):
     cfg_seg.model.train_cfg = None
     modelseg = build_segmentor(cfg_seg.model, test_cfg=cfg_seg.get("test_cfg"))
 
-    constructed_filename = str("C:/Users/Rashid/Desktop/bdd100k/Combined/"+cfg_seg.load_from.split()[-1].split("/")[-1])
+    constructed_filename = str("C:/Users/fatim/Desktop/DTNet/bdd100k-models/drivable/"+cfg_seg.load_from.split()[-1].split("/")[-1])
     #print("Constructed Filename:", constructed_filename)
 
     modelseg = init_segmentor(cfg_seg, constructed_filename, device=0)
@@ -674,49 +1019,50 @@ def predict_img(args):
     modelseg.PALETTE = [[219, 94, 86], [86, 211, 219], [0, 0, 0]]
     #modelseg.PALETTE = [[0, 0, 255], [0, 255, 0], [0, 0, 0]]
     modelseg.to(0)
-    output_path_p = 'C:/Users/Rashid/Desktop/bdd100k/data_road/training/res_p'
-    output_path_g = 'C:/Users/Rashid/Desktop/bdd100k/data_road/training/res_g'
-    output_path_ = 'C:/Users/Rashid/Desktop/bdd100k/data_road/training/res_c'
-    output_m = 'C:/Users/Rashid/Desktop/bdd100k/data_road/training/kitti_predicted'
-    output_ogm = 'C:/Users/Rashid/Desktop/bdd100k/data_road/training/og_masks_bdd'
-    output_s = 'C:/Users/Rashid/Desktop/bdd100k/data_road/training/Steering'
-    images = os.listdir(os.path.join(args.imagefolder, "image_2"))
-    labels = os.listdir(os.path.join(args.imagefolder, "gt_image_2"))
-    #images = os.listdir('C:/Users/Rashid/Desktop/bdd100k/DataSearch/bdd100k/images/100k/val')
-    #labels = os.listdir('C:/Users/Rashid/Desktop/bdd100k/DataSearch/bdd100k/labels/drivable/masks/val')
+    #output_path_p = 'C:/Users/Rashid/Desktop/bdd100k/data_road/training/res_p'
+    #output_path_g = 'C:/Users/Rashid/Desktop/bdd100k/data_road/training/res_g'
+    #output_path_ = 'C:/Users/Rashid/Desktop/bdd100k/data_road/training/res_c'
+    #output_m = 'C:/Users/Rashid/Desktop/bdd100k/data_road/training/kitti_predicted'
+    #output_ogm = 'C:/Users/Rashid/Desktop/bdd100k/data_road/training/og_masks_bdd'
+    #output_s = 'C:/Users/Rashid/Desktop/bdd100k/data_road/training/Steering'
+    if ds == "kitti":
+        images = os.listdir(os.path.join(args.imagefolder, "image_2"))
+        labels = os.listdir(os.path.join(args.imagefolder, "gt_image_2"))
+        #images = os.listdir('C:/Users/Rashid/Desktop/bdd100k/DataSearch/bdd100k/images/100k/val')
+        #labels = os.listdir('C:/Users/Rashid/Desktop/bdd100k/DataSearch/bdd100k/labels/drivable/masks/val')
 
-    columns = ["Image Name", "RMSE", "ED", "HD"]  # Add more metrics as needed
-    df = pd.DataFrame(columns=columns)
+        columns = ["Image Name", "RMSE", "ED", "HD"]  # Add more metrics as needed
+        df = pd.DataFrame(columns=columns)
 
-    for i in range(289):
-        print("image "+ str(i)+ " of "+str(len(images)))
-        img = cv2.imread(os.path.join(args.imagefolder + "/image_2", images[i]))
-        if images[i][:3] == "umm":
-            label = cv2.imread(os.path.join(args.imagefolder + "/gt_image_2", "umm_road_"+images[i][4:]))
-        elif images[i][:3] == "um_":
-            label = cv2.imread(os.path.join(args.imagefolder + "/gt_image_2", "um_lane_"+images[i][3:]))
-        elif images[i][:3] == "uu_":
-            label = cv2.imread(os.path.join(args.imagefolder + "/gt_image_2", "uu_road_"+images[i][3:]))
+        for i in range(289):
+            print("image "+ str(i)+ " of "+str(len(images)))
+            img = cv2.imread(os.path.join(args.imagefolder + "/image_2", images[i]))
+            if images[i][:3] == "umm":
+                label = cv2.imread(os.path.join(args.imagefolder + "/gt_image_2", "umm_road_"+images[i][4:]))
+            elif images[i][:3] == "um_":
+                label = cv2.imread(os.path.join(args.imagefolder + "/gt_image_2", "um_lane_"+images[i][3:]))
+            elif images[i][:3] == "uu_":
+                label = cv2.imread(os.path.join(args.imagefolder + "/gt_image_2", "uu_road_"+images[i][3:]))
 
-        if images[i][:3] == "umm":
-            labelname = images[i]
-        elif images[i][:3] == "um_":
-            labelname = images[i]
-        elif images[i][:3] == "uu_":
-            labelname = images[i]
+            if images[i][:3] == "umm":
+                labelname = images[i]
+            elif images[i][:3] == "um_":
+                labelname = images[i]
+            elif images[i][:3] == "uu_":
+                labelname = images[i]
 
-        #img = cv2.imread(os.path.join('C:/Users/Rashid/Desktop/bdd100k/DataSearch/bdd100k/images/100k/val', images[i]))
-        #label = cv2.imread(os.path.join('C:/Users/Rashid/Desktop/bdd100k/DataSearch/bdd100k/labels/drivable/masks/val', labels[i]))
-        labell = label.copy()
-        mask1 = (labell[:,:,2]==0)
-        mask2 = (labell[:,:,2]==1)
+            #img = cv2.imread(os.path.join('C:/Users/Rashid/Desktop/bdd100k/DataSearch/bdd100k/images/100k/val', images[i]))
+            #label = cv2.imread(os.path.join('C:/Users/Rashid/Desktop/bdd100k/DataSearch/bdd100k/labels/drivable/masks/val', labels[i]))
+            labell = label.copy()
+            mask1 = (labell[:,:,2]==0)
+            mask2 = (labell[:,:,2]==1)
 
-        labell[mask1] = [255,0,0]
-        labell[mask2] = [0,0,0]
-        #cv2.imwrite(os.path.join(output_ogm, images[i]), labell)
-        img_tensor = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0  # Change format to channel-first
-        img_tensor = img_tensor.unsqueeze(0).to(0)
-        img_meta = [dict(
+            labell[mask1] = [255,0,0]
+            labell[mask2] = [0,0,0]
+            #cv2.imwrite(os.path.join(output_ogm, images[i]), labell)
+            img_tensor = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0  # Change format to channel-first
+            img_tensor = img_tensor.unsqueeze(0).to(0)
+            img_meta = [dict(
                     filename=images[i],  # Set the filename as needed
                     ori_shape=img.shape,
                     img_shape=img.shape,
@@ -724,86 +1070,209 @@ def predict_img(args):
                     scale_factor=1.0,
                     flip=False,
                     batch_input_shape=(1, 3, img.shape[0], img.shape[1]),  # Adjust as needed
-        )]
-        with torch.no_grad():
-            outputsdet = modeldet.forward_test([img_tensor], [img_meta], rescale=True)
-        with torch.no_grad():
-            outputsseg = inference_segmentor(modelseg, img)
+            )]
+            with torch.no_grad():
+                outputsdet = modeldet.forward_test([img_tensor], [img_meta], rescale=True)
+            with torch.no_grad():
+                outputsseg = inference_segmentor(modelseg, img)
                 
-        det = Draw_Det_Mask(outputsdet, (img.shape[0], img.shape[1]))
+            det = Draw_Det_Mask(outputsdet, (img.shape[0], img.shape[1]))
 
-        seg = Draw_Seg_Mask(outputsseg)
-
-
-        # Create masks based on the element-wise comparisons
-        #masky = (labell[:,:,1]!=0)  
-        #maskp = (labell[:,:,0]!=0)
-        #seg[maskp] = [0,255,0]
-        #seg[masky] = [255,0,0]
+            seg = Draw_Seg_Mask(outputsseg)
 
 
-
-        comb = CombineMasks(args, seg, det)
-
-        mask = (comb[:,:,1]==255)
-        if label[:3] =="umm": comb[mask] = [255, 0, 0]
-        else: comb[mask] = [0, 0, 0]
-
-        imgcopy = img.copy()
-        imgcopy1 = img.copy()
-        imgcopy2 = img.copy()
-        #pathp, predicted= GeneratePath(comb, img, theta =-3.1)
-        #cv2.imwrite(os.path.join(output_s, str(images[i][:-4])+"_left.jpg"), predicted)
-        pathp, predicted= GeneratePath(comb, imgcopy1)
-        #cv2.imwrite(os.path.join(output_s, str(images[i][:-4])+"_center.jpg"), predicted)
-        #pathp, predicted= GeneratePath(comb, imgcopy2, theta =3.1)
-        #cv2.imwrite(os.path.join(output_s, str(images[i][:-4])+"_right.jpg"), predicted)
-        #cv2.imwrite(os.path.join(output_m, labelname), seg)
-
-
-        #cv2.imwrite(os.path.join(output_path_p, labels[i]), predicted)
-
-        #comb[mask] = [255, 0, 255]
-        #comb[mask==0] = [0, 0, 255]
-
-        mask = (labell[:, :, 0] != 255)
-        labell[mask] = [0, 0, 0]
-        #label[mask == 0] = [255, 0, 0]
-        #mask = (labell[:,:,0]!=0)
-        #labell[mask] = [255, 0, 0]
-        #labell[mask == 0] = [0, 0, 0]
-        pathg, groundtruth = GeneratePath(labell, imgcopy)
-        #cv2.imwrite(os.path.join(output_path_g, labels[i]), groundtruth)
-
-        values = compare2(pathg, pathp, images[i])
-        df = pd.concat([df, values], ignore_index=True)
-
-        path_color = np.array([0, 255, 0])  
-
-        # Create masks to isolate path pixels in each image
-        mask1 = cv2.inRange(predicted, path_color, path_color)
-        groundtruth[mask1==255] = [255, 0, 0]
-
-        label_rect_position = (groundtruth.shape[1] - 320, 10)
-        label_rect_size = (310, 80)
-        cv2.rectangle(groundtruth, label_rect_position, (label_rect_position[0] + label_rect_size[0], label_rect_position[1] + label_rect_size[1]), (255, 255, 255), -1)
-
-        #Add labels inside the rectangle
-        label_text_position = (groundtruth.shape[1] - 310, 45)
-        cv2.putText(groundtruth, "Ground Truth Path", label_text_position, cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-        label_text_position = (groundtruth.shape[1] - 310, 80)
-        cv2.putText(groundtruth, "Predicted Path", label_text_position, cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+            # Create masks based on the element-wise comparisons
+            #masky = (labell[:,:,1]!=0)  
+            #maskp = (labell[:,:,0]!=0)
+            #seg[maskp] = [0,255,0]
+            #seg[masky] = [255,0,0]
 
 
 
-        #cv2.imwrite(os.path.join(output_path_, images[i]), groundtruth)
+            comb = CombineMasks(args, seg, det)
 
-        #cv2.imshow("Result", groundtruth)
-        #cv2.waitKey(0)  # Wait until a key is pressed
-        #cv2.destroyAllWindows()  # Close all windows
-    df.to_csv('path_values_kitti.csv', index=False)
+            mask = (comb[:,:,1]==255)
+            if label[:3] =="umm": comb[mask] = [255, 0, 0]
+            else: comb[mask] = [0, 0, 0]
 
+            imgcopy = img.copy()
+            imgcopy1 = img.copy()
+            imgcopy2 = img.copy()
+            #pathp, predicted= GeneratePath(comb, img, theta =-3.1)
+            #cv2.imwrite(os.path.join(output_s, str(images[i][:-4])+"_left.jpg"), predicted)
+            #pathp, predicted= GeneratePath(comb, imgcopy1)
+            #cv2.imwrite(os.path.join(output_s, str(images[i][:-4])+"_center.jpg"), predicted)
+            #pathp, predicted= GeneratePath(comb, imgcopy2, theta =3.1)
+            #cv2.imwrite(os.path.join(output_s, str(images[i][:-4])+"_right.jpg"), predicted)
+            #cv2.imwrite(os.path.join(output_m, labelname), seg)
+            predicted, pathp = find_center_path_smooth(comb, imgcopy1)
+
+            #cv2.imwrite(os.path.join(output_path_p, labels[i]), predicted)
+
+            #comb[mask] = [255, 0, 255]
+            #comb[mask==0] = [0, 0, 255]
+
+            mask = (labell[:, :, 0] != 255)
+            labell[mask] = [0, 0, 0]
+            #label[mask == 0] = [255, 0, 0]
+            #mask = (labell[:,:,0]!=0)
+            #labell[mask] = [255, 0, 0]
+            #labell[mask == 0] = [0, 0, 0]
+            pathg, groundtruth = GeneratePath(labell, imgcopy)
+            #cv2.imwrite(os.path.join(output_path_g, labels[i]), groundtruth)
+
+            values = compare2(pathg, pathp, images[i])
+            df = pd.concat([df, values], ignore_index=True)
+
+            path_color = np.array([0, 255, 0])  
+
+            # Create masks to isolate path pixels in each image
+            mask1 = cv2.inRange(predicted, path_color, path_color)
+            groundtruth[mask1==255] = [255, 0, 0]
+
+            label_rect_position = (groundtruth.shape[1] - 320, 10)
+            label_rect_size = (310, 80)
+            cv2.rectangle(groundtruth, label_rect_position, (label_rect_position[0] + label_rect_size[0], label_rect_position[1] + label_rect_size[1]), (255, 255, 255), -1)
+
+            #Add labels inside the rectangle
+            label_text_position = (groundtruth.shape[1] - 310, 45)
+            cv2.putText(groundtruth, "Ground Truth Path", label_text_position, cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            label_text_position = (groundtruth.shape[1] - 310, 80)
+            cv2.putText(groundtruth, "Predicted Path", label_text_position, cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+        
+
+
+            #cv2.imwrite(os.path.join(output_path_, images[i]), groundtruth)
+
+            #cv2.imshow("Result", groundtruth)
+            #cv2.waitKey(0)  # Wait until a key is pressed
+            #cv2.destroyAllWindows()  # Close all windows
+        numeric_columns = df.select_dtypes(include=np.number)
+
+
+        averages = numeric_columns.mean()
+        print(len(numeric_columns))
+        print(averages)
+        df_with_averages = pd.concat([averages], ignore_index=True)
+        df_with_averages.to_csv('path_values_kitti.csv', index=False)
+
+
+    elif ds == "bdd":
+        
+        images = os.listdir('C:/Users/fatim/Desktop/DTNet/bdd100k-models/DataSearch/bdd100k/images/100k/val')
+        labels = os.listdir('C:/Users/fatim/Desktop/DTNet/bdd100k-models/DataSearch/bdd100k/labels/drivable/masks/val')
+        
+        columns = ["Image Name", "RMSE", "ED", "HD"]  # Add more metrics as needed
+        df = pd.DataFrame(columns=columns)
+        for i in range(len(images)):
+            print("image "+ str(i)+ " of "+str(len(images)))
+            img = cv2.imread(os.path.join('C:/Users/fatim/Desktop/DTNet/bdd100k-models/DataSearch/bdd100k/images/100k/val', images[i]))
+            label = cv2.imread(os.path.join('C:/Users/fatim/Desktop/DTNet/bdd100k-models/DataSearch/bdd100k/labels/drivable/masks/val', labels[i]))
+            labell = label.copy()
+            mask1 = (labell[:,:,2]==0)
+            mask2 = (labell[:,:,2]==1)
+
+            labell[mask1] = [255,0,0]
+            labell[mask2] = [0,0,0]
+            #cv2.imwrite(os.path.join(output_ogm, images[i]), labell)
+            img_tensor = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0  # Change format to channel-first
+            img_tensor = img_tensor.unsqueeze(0).to(0)
+            img_meta = [dict(
+                    filename=images[i],  # Set the filename as needed
+                    ori_shape=img.shape,
+                    img_shape=img.shape,
+                    pad_shape=img.shape,
+                    scale_factor=1.0,
+                    flip=False,
+                    batch_input_shape=(1, 3, img.shape[0], img.shape[1]),  # Adjust as needed
+            )]
+            with torch.no_grad():
+                outputsdet = modeldet.forward_test([img_tensor], [img_meta], rescale=True)
+            with torch.no_grad():
+                outputsseg = inference_segmentor(modelseg, img)
+                
+            det = Draw_Det_Mask(outputsdet, (img.shape[0], img.shape[1]))
+
+            seg = Draw_Seg_Mask(outputsseg)
+
+
+            #Create masks based on the element-wise comparisons
+            masky = (labell[:,:,1]!=0)  
+            maskp = (labell[:,:,0]!=0)
+            seg[maskp] = [0,255,0]
+            seg[masky] = [255,0,0]
+
+
+
+            comb = CombineMasks(args, seg, det)
+
+            mask = (comb[:,:,1]==255)
+
+            imgcopy = img.copy()
+            imgcopy1 = img.copy()
+            imgcopy2 = img.copy()
+            #pathp, predicted= GeneratePath(comb, img, theta =-3.1)
+            #cv2.imwrite(os.path.join(output_s, str(images[i][:-4])+"_left.jpg"), predicted)
+            #pathp, predicted= GeneratePath(comb, imgcopy1)
+            #cv2.imwrite(os.path.join(output_s, str(images[i][:-4])+"_center.jpg"), predicted)
+            #pathp, predicted= GeneratePath(comb, imgcopy2, theta =3.1)
+            #cv2.imwrite(os.path.join(output_s, str(images[i][:-4])+"_right.jpg"), predicted)
+            #cv2.imwrite(os.path.join(output_m, labelname), seg)
+            predicted, pathp = find_center_path_smooth(comb, imgcopy1)
+
+            #cv2.imwrite(os.path.join(output_path_p, labels[i]), predicted)
+
+            comb[mask] = [255, 0, 255]
+            comb[mask==0] = [0, 0, 255]
+
+            mask = (labell[:, :, 0] != 255)
+            labell[mask] = [0, 0, 0]
+            #label[mask == 0] = [255, 0, 0]
+            #mask = (labell[:,:,0]!=0)
+            #labell[mask] = [255, 0, 0]
+            #labell[mask == 0] = [0, 0, 0]
+            pathg, groundtruth = GeneratePath(labell, imgcopy)
+            #cv2.imwrite(os.path.join(output_path_g, labels[i]), groundtruth)
+
+            values = compare2(pathg, pathp, images[i])
+            df = pd.concat([df, values], ignore_index=True)
+
+            path_color = np.array([0, 255, 0])  
+
+            # Create masks to isolate path pixels in each image
+            mask1 = cv2.inRange(predicted, path_color, path_color)
+            groundtruth[mask1==255] = [255, 0, 0]
+
+            label_rect_position = (groundtruth.shape[1] - 320, 10)
+            label_rect_size = (310, 80)
+            cv2.rectangle(groundtruth, label_rect_position, (label_rect_position[0] + label_rect_size[0], label_rect_position[1] + label_rect_size[1]), (255, 255, 255), -1)
+
+            #Add labels inside the rectangle
+            label_text_position = (groundtruth.shape[1] - 310, 45)
+            cv2.putText(groundtruth, "Ground Truth Path", label_text_position, cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            label_text_position = (groundtruth.shape[1] - 310, 80)
+            cv2.putText(groundtruth, "Predicted Path", label_text_position, cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+        
+
+
+            #cv2.imwrite(os.path.join(output_path_, images[i]), groundtruth)
+
+            #cv2.imshow("Result", groundtruth)
+            #cv2.waitKey(0)  # Wait until a key is pressed
+            #cv2.destroyAllWindows()  # Close all windows
+        numeric_columns = df.select_dtypes(include=np.number)
+
+
+        averages = numeric_columns.mean()
+        print(len(numeric_columns))
+        print(averages)
+        df_with_averages = pd.concat([averages], ignore_index=True)
+        df_with_averages.to_csv('path_values_bdd.csv', index=False)
+
+
+        
 def compare2(gt, pred, name):
         new_x = []
         
@@ -821,7 +1290,7 @@ def compare2(gt, pred, name):
         else:
             xgt = [0 for x in range(len(pred))]
             ygt = []
-        if pred:
+        if pred.size > 0:
             xpr, ypr = zip(*pred)
             if not ygt: ygt = ypr
         else:
@@ -834,7 +1303,9 @@ def compare2(gt, pred, name):
             "RMSE": [0],
             #"MAD": [0],
             "ED": [0],
-            "HD": [0]
+            "HD": [0],
+            "FD": [0],
+            "DTW": [0],
             })
             return current_data
         
@@ -849,11 +1320,13 @@ def compare2(gt, pred, name):
         
         RMSEPath =rmse(np.array(new_x), np.array(xgt))
         # print(RMSEPath)
-        
+
         MADPath=mad(xgt, ygt, new_x, ygt)
         MAD=MADPath[0]
         MED = mean_euclidean_distance(xgt, ygt, new_x, ygt)
         HD = hausdorff(xgt, ygt, new_x, ygt)
+        FD = frechet(xgt, ygt, new_x, ygt)
+        DTW = Dynamic_Time_Warping(xgt, ygt, new_x, ygt)
        
         # print("MAD:", MADPath[0])
         # print("ED:", MED)
@@ -865,7 +1338,10 @@ def compare2(gt, pred, name):
             "RMSE": [RMSEPath],
             #"MAD": [MAD],
             "ED": [MED],
-            "HD": [HD]
+            "HD": [HD],
+            "FD": [FD],
+            "DTW": [DTW],
+
         })
 
         # Append the current data to the main DataFrame
@@ -893,8 +1369,80 @@ def hausdorff(x1, y1, x2, y2):
     points2 = np.column_stack((x2, y2))
     return distance.directed_hausdorff(points1, points2)[0]
 
+def euclidean_distance(p1, p2):
+    """
+    Calculate the Euclidean distance between two points.
+    """
+    return np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+
 def rmse(predictions, targets):
     return np.sqrt(((predictions - targets) ** 2).mean())
+
+def frechet(x1, y1, x2, y2):
+    """
+    Calculate the Frechet distance between two curves defined by sequences of points.
+    """
+    curve1 = [(x1[i], y1[i]) for i in range(len(x1))]
+    curve2 = [(x2[i], y2[i]) for i in range(len(x2))]
+
+    n = len(curve1)
+    m = len(curve2)
+
+    # Initialize memoization table with -1
+    memo = np.ones((n, m)) * -1
+
+    # Initialize the first row and column of the memoization table
+    memo[0, 0] = euclidean_distance(curve1[0], curve2[0])
+    for i in range(1, n):
+        memo[i, 0] = max(memo[i - 1, 0], euclidean_distance(curve1[i], curve2[0]))
+    for j in range(1, m):
+        memo[0, j] = max(memo[0, j - 1], euclidean_distance(curve1[0], curve2[j]))
+
+    # Fill the memoization table iteratively
+    for i in range(1, n):
+        for j in range(1, m):
+            memo[i, j] = max(
+                min(
+                    memo[i - 1, j],
+                    memo[i, j - 1],
+                    memo[i - 1, j - 1]
+                ),
+                euclidean_distance(curve1[i], curve2[j])
+            )
+
+    return memo[n - 1, m - 1]
+
+
+def Dynamic_Time_Warping(x1, y1, x2, y2):
+    """
+    Calculate the Dynamic Time Warping (DTW) distance between two sequences of x and y coordinates.
+    """
+    # Compute the Euclidean distance matrix
+    n = len(x1)
+    m = len(x2)
+    euclidean_matrix = np.zeros((n, m))
+    for i in range(n):
+        for j in range(m):
+            euclidean_matrix[i, j] = euclidean_distance((x1[i], y1[i]), (x2[j], y2[j]))
+
+    # Initialize the DTW matrix with zeros
+    dtw_matrix = np.zeros((n, m))
+
+    # Initialize the first row and column of the DTW matrix
+    dtw_matrix[0, 0] = euclidean_matrix[0, 0]
+    for i in range(1, n):
+        dtw_matrix[i, 0] = dtw_matrix[i - 1, 0] + euclidean_matrix[i, 0]
+    for j in range(1, m):
+        dtw_matrix[0, j] = dtw_matrix[0, j - 1] + euclidean_matrix[0, j]
+
+    # Fill in the rest of the DTW matrix
+    for i in range(1, n):
+        for j in range(1, m):
+            cost = euclidean_matrix[i, j]
+            dtw_matrix[i, j] = cost + min(dtw_matrix[i - 1, j], dtw_matrix[i, j - 1], dtw_matrix[i - 1, j - 1])
+
+    # Return the DTW distance (bottom-right element of the matrix)
+    return dtw_matrix[n - 1, m - 1]
 
 
 def findcolors(img):
@@ -1415,7 +1963,7 @@ def predict_feed(args):
     cfg_seg.model.train_cfg = None
     modelseg = build_segmentor(cfg_seg.model, test_cfg=cfg_seg.get("test_cfg"))
 
-    constructed_filename = str("C:/Users/Rashid/Desktop/bdd100k/Combined/"+cfg_seg.load_from.split()[-1].split("/")[-1])
+    constructed_filename = str("C:/Users/fatim/Desktop/DTNet/bdd100k-models/drivable/"+cfg_seg.load_from.split()[-1].split("/")[-1])
     #print("Constructed Filename:", constructed_filename)
 
     modelseg = init_segmentor(cfg_seg, constructed_filename, device=0)
@@ -1423,8 +1971,22 @@ def predict_feed(args):
     modelseg.PALETTE = [[219, 94, 86], [86, 211, 219], [0, 0, 0]]
     #modelseg.PALETTE = [[0, 0, 255], [0, 255, 0], [0, 0, 0]]
     modelseg.to(0)
-    paths = []
+    #paths = []
     i = 0
+    pygame.init()
+    joystick = pygame.joystick.Joystick(0)
+    joystick.init()
+    velocity = 0.1
+    # Prints the joystick's name
+    JoyName = pygame.joystick.Joystick(0).get_name()
+    #print ("Name of the joystick:")
+    #print (JoyName)
+    # Gets the number of axes
+    JoyAx = pygame.joystick.Joystick(0).get_numaxes()
+    #print ("Number of axis:")
+    #print (JoyAx)
+
+    prev = []
     while True:
      if i%12 == 0:
         ret, img = obs_virtual_camera.read()
@@ -1462,13 +2024,30 @@ def predict_feed(args):
         del outputsseg
         #det = Draw_Det_Mask(outputsdet, (img.shape[0], img.shape[1]))
         comb = CombineMasks(args, seg, det)
-        path, img= GeneratePath(comb, img, paths)
-        if path: paths.append(path)
-        if len(paths)>100: paths.pop(0)
-    
-        # Display the processed frame
+        #path, img= GeneratePath(comb, img, paths)
+
+        pygame.event.pump()
+        #print (pygame.joystick.Joystick(0).get_axis(0))
+        #img, path= find_center_path_smooth(comb, img, joystick.get_axis(0))
+        img, _, _, _, _, path = find_center_path_smooth_new(comb, img, prev, 1, joystick.get_axis(0))
+        #Path Averaging if needed
+        #if path: paths.append(path)
+        #if len(paths)>100: paths.pop(0)
+        cv2.namedWindow("Processed Frame", cv2.WINDOW_NORMAL)
+
+        cv2.resizeWindow("Processed Frame", int(1280*1.25), int(720*1.25))  
+
         cv2.imshow("Processed Frame", img)
         del img
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+        cv2.namedWindow("Segmentation Mask", cv2.WINDOW_NORMAL)
+
+        cv2.resizeWindow("Segmentation Mask", int(1280*1.25), int(720*1.25)) 
+
+        cv2.imshow("Segmentation Mask", comb)
+        del comb
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
      i += 1
@@ -1499,6 +2078,14 @@ def test(args):
     cv2.imshow("Result", img)
     cv2.waitKey(0)  # Wait until a key is pressed
     cv2.destroyAllWindows()  # Close all windows
+
+
+
+
+
+
+
+
 def main() -> None:
     """Main function for model inference."""
     torch.cuda.empty_cache()
@@ -1506,11 +2093,11 @@ def main() -> None:
     args = parse_args() 
     #check_color()
     #predict_videos(args)
-    #predict_img(args)
-    predict(args)
+    #predict_img(args, ds="bdd")
+    #predict(args)
     #compare()
     #overlay()
-    #predict_feed(args)
+    predict_feed(args)
     #test(args)
 
     

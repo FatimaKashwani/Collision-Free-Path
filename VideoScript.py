@@ -1373,9 +1373,9 @@ def predict_videos(args):
             print("video " + str(i) + " of "+str(len(vids)))
             predict(args, os.path.join(in_path, video), os.path.join(out_path, video))
 
-def predict_feed():
+def predict_feed(args):
     print("Args: ")
-    args = parse_args()
+    #args = parse_args()
     torch.cuda.empty_cache()
     torch.cuda.empty_cache()
     
@@ -1452,7 +1452,7 @@ def predict_feed():
     cfg_seg.model.train_cfg = None
     modelseg = build_segmentor(cfg_seg.model, test_cfg=cfg_seg.get("test_cfg"))
 
-    constructed_filename = str("C:/Users/Rashid/Desktop/bdd100k/Combined/"+cfg_seg.load_from.split()[-1].split("/")[-1])
+    #constructed_filename = str("C:/Users/Rashid/Desktop/bdd100k/Combined/"+cfg_seg.load_from.split()[-1].split("/")[-1])
     #print("Constructed Filename:", constructed_filename)
 
     modelseg = init_segmentor(cfg_seg, constructed_filename, device=0)
@@ -1526,12 +1526,14 @@ def check_color():
         #cv2.destroyAllWindows()  # Close all windows
 def main() -> None:
     """Main function for model inference."""
+    print("Initializing...")
     torch.cuda.empty_cache()
     torch.cuda.empty_cache()
     args = parse_args() 
     #check_color()
     #predict_videos(args)
     #predict_img(args)
+    print("Predict")
     predict(args)
     #compare()
     #overlay()
